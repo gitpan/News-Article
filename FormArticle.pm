@@ -4,12 +4,18 @@
 #
 # Copyright 1997 Andrew Gierth. Redistribution terms at end of file.
 #
-# $Id: FormArticle.pm 1.3 1997/10/22 21:00:54 andrew Exp $
+# $Id: FormArticle.pm 1.7 2000/04/14 15:12:28 andrew Exp $
 #
 
 =head1 NAME
 
 News::FormArticle - derivative of News::Article
+
+=head1 SYNOPSIS
+
+  use News::FormArticle;
+
+See below for functions available.
 
 =head1 DESCRIPTION
 
@@ -57,7 +63,6 @@ Exports nothing.
 package News::FormArticle;
 
 use strict;
-use English;
 
 use News::Article;
 use FileHandle ();
@@ -73,23 +78,24 @@ use subs qw(process_line);
 
 =over 4
 
-=item new ( FILENAME [, SOURCE [...]] )
+=item new ( FILE [, SOURCE [...]] )
 
 Construct an article from the specified file, performing variable
-substitution with values supplied by the C<SOURCE> parameters
-(see Description).
+substitution with values supplied by the C<SOURCE> parameters (see
+Description). FILE is any form of data recognised by News::Article\'s
+read() method.
 
 =cut
 
 sub new
 {
     my $class = shift;
-    my $filename = shift;
+    my $file = shift;
     my $substs = \@_;
-    my $fh = new FileHandle("<$filename");
-    return undef unless $fh;
+    my $src = News::Article::source_init($file);
+    return undef unless defined($src);
 
-    $class->SUPER::new(sub { process_line($fh,$substs) });
+    $class->SUPER::new(sub { process_line($src,$substs) });
 }
 
 ###########################################################################
@@ -155,11 +161,12 @@ sub subst_array
 
 sub process_line
 {
-    my ($fh, $substs) = @_;
+    my ($src, $substs) = @_;
 
-    local $_ = <$fh>;
-    return undef unless $_;
+    local $_ = &$src();
+    return undef unless defined($_);
     chomp;
+    $_ .= "\n";
 
     # look for substitution patterns. We recognize:
     #  ?WORD

@@ -6,11 +6,11 @@
 #
 # Copyright 1997 Andrew Gierth. Redistribution terms at end of file.
 #
-# $Id: Article.pm 1.13 1997/12/27 23:19:07 andrew Exp $
+# $Id: Article.pm 1.26 2001/11/08 14:11:43 andrew Exp $
 #
 # TODO:
 #   - better way of handling the system-dependent configuration
-#   - reformat for 80 columns :-)
+#   - reformat source for 80 columns :-)
 #
 ###########################################################################
 #
@@ -33,7 +33,7 @@ See below for functions available.
 
 An object for representing a Usenet article (or a mail
 message). Primarily written for use with mail2news and/or moderation
-programs.
+programs. (Not really intended for transit use.)
 
 =head1 USAGE
 
@@ -41,25 +41,19 @@ programs.
 
 Article exports nothing.
 
-A new Article object must be created with the I<new> method.
+Article objects must be created with the I<new> method.
 
 =cut
 
 package News::Article;
 
 use strict;
-use English;
-
-use FileHandle ();
-use Net::Domain qw(hostfqdn);
-use Net::NNTP ();
-use IPC::Open3 qw(open3);
-use PGP::Sign qw(pgp_sign pgp_verify pgp_error);
+use SelfLoader;
 
 use vars qw($VERSION @SENDMAIL %SPECIAL %UNIQUE);
 use subs qw(canonical fix_envelope source_init);
 
-($VERSION = (split (' ', q$Revision: 1.13 $ ))[1]) =~ s/\.(\d)$/.0$1/;
+($VERSION = (split (' ', q$Revision: 1.26 $ ))[1]) =~ s/\.(\d)$/.0$1/;
 
 ###########################################################################
 # System-dependent configuration
@@ -80,9 +74,8 @@ use subs qw(canonical fix_envelope source_init);
 #
 # Words to treat specially when canonifying header names
 
-%SPECIAL = ('-'    => '-',    '_'    => '_',
-	    'id'   => 'ID',   'pgp'  => 'PGP',  'nntp' => 'NNTP', 
-	    'uidl' => 'UIDL', 'mime' => 'MIME', 'smtp' => 'SMTP');
+%SPECIAL = map { lc $_ => $_ }
+           qw(- _ ID PGP UIDL MIME NNTP SMTP IP URL HTTP WWW MimeOLE);
 
 # RFC1036 (and news generally) is much less tolerant of multiple
 # fields than RFC822. 822 allows for multiple message-ids, which is
@@ -90,8 +83,9 @@ use subs qw(canonical fix_envelope source_init);
 # most significant news fields; handling the rest sensibly is up to
 # the caller.
 
-%UNIQUE = map { $_ => 1 } qw(date followup-to from message-id newsgroups 
-			     path reply-to subject sender);
+%UNIQUE = map { $_ => 1 }
+          qw(date followup-to from message-id newsgroups path reply-to
+             subject sender);
 
 # Description of internal storage:
 #
@@ -109,6 +103,13 @@ use subs qw(canonical fix_envelope source_init);
 #   element, with embedded newlines preserved (but trailing ones
 #   removed).
 #
+# $self->{HeaderSeq}
+#
+#   Only set if headers have been read in; array of canonical header
+#   names, in the order they were read in. Used to derive this from
+#   RawHeaders, but that's wrong if read_headers has been called more
+#   than once.
+#
 # $self->{Envelope}
 #
 #   Envelope From address. Set from a Unix-style "From " header on
@@ -119,6 +120,14 @@ use subs qw(canonical fix_envelope source_init);
 #
 #   Array of text lines forming the body. Never contains embedded
 #   newlines.
+#
+# $self->{Sendmail}
+#
+#   What to use to send mail.
+#
+# $self->{HdrsFirst}, $self->{HdrsEnd}, $self->{HdrsLast}
+#
+#   settings of headers_first, headers_next and headers_last
 #
 
 ###########################################################################
@@ -141,7 +150,8 @@ as for C<read>.
 
 sub new
 {
-    my $class = shift;
+    my $proto = shift;
+    my $class = ref($proto) || $proto;
     my $self = { 
 	Headers    => {},
 	RawHeaders => [],
@@ -160,6 +170,18 @@ sub new
     $self;
 }
 
+# this shouldn't be needed. But SelfLoader tries to load it in derived
+# modules if it's not found here, and those modules may not have __DATA__
+# tokens, leading to rude error messages.
+
+sub DESTROY {}
+
+SelfLoader->load_stubs();
+
+1;
+
+__DATA__
+
 #--------------------------------------------------------------------------
 
 =item clone ()
@@ -177,14 +199,25 @@ sub clone
     my $obj = {
 	Headers    => $headers,
 	RawHeaders => [ @{$src->{RawHeaders}} ],
+	HeaderSeq  => [ defined($src->{HeaderSeq}) ? @{$src->{HeaderSeq}} : () ],
 	Envelope   => $src->{Envelope},
 	Sendmail   => [ @{$src->{Sendmail}} ],
 	Body       => [ @{$src->{Body}} ],
     };
 
+    # must deep-copy the headers hash elements, otherwise they
+    # get shared with rather messy results.
+
     for (keys %{$src->{Headers}})
     {
 	$headers->{$_} = [ @{$src->{Headers}{$_}} ];
+    }
+
+    # copy default header sequence info too
+
+    for (qw(HdrsFirst HdrsEnd HdrsLast))
+    {
+	$obj->{$_} = [ @{$src->{$_}} ] if defined($src->{$_});
     }
 
     return bless $obj,$class;
@@ -257,6 +290,9 @@ names. The order of the returned headers is as follows:
  - any remaining headers not named in LAST, sorted by name
  - headers named in LAST (all values)
 
+LAST overrides the original order of headers, but NEXT does not.
+Headers named in LAST will also be grouped together by header name.
+
 =cut
 
 sub headers
@@ -266,21 +302,30 @@ sub headers
     my @preseq = map { canonical $_ } @{shift || $self->{HdrsFirst} || []};
     my @addseq = map { canonical $_ } @{shift || $self->{HdrsEnd} || []};
     my @postseq = map { canonical $_ } @{shift || $self->{HdrsLast} || []};
-    my %postseq = map { ($_,1) } @postseq;
+    my %postseq = map { $_ => 1 } @postseq;
+
+    # this hash gets all the headers in the form that we will use to
+    # output them. Each value is an array of strings of the form
+    # "Header-Name: value". The keys are in canonical rather than
+    # internal form.
     my %tmph = map { my $h = canonical($_);
 		     ($h, [ map { $h.": ".$_ } @{$hdrs->{$_}} ])
 		     } keys %$hdrs;
-    my @seq = map { /^([\w-]+):\s/ ? (canonical $1) : "X-Broken-Header" } @{$self->{RawHeaders}};
-    @seq = grep { !$postseq{$_} } @seq;
-    my $v;
 
-    ((map { $v = $tmph{$_}; $v && @$v ? pop(@$v) : (); } @preseq),
-     (map { $v = $tmph{$_}; $v && @$v ? pop(@$v) : (); } @seq),
-     (map { $v = $tmph{$_}; $v && @$v ? pop(@$v) : (); } @addseq),
-     (map { $v = $tmph{$_}; $v && @$v ? (@{$tmph{$_}}) : () }
+    # original sequence of headers (if any) excluding those we wish
+    # to force to the end.
+    my @seq = grep { !$postseq{$_} } @{$self->{HeaderSeq} || []};
+
+    # build the required list
+    ((map { my $v = $tmph{$_}; $v && @$v ? shift(@$v) : (); } @preseq),
+     (map { my $v = $tmph{$_}; $v && @$v ? shift(@$v) : (); } @seq),
+     (map { my $v = $tmph{$_}; $v && @$v ? shift(@$v) : (); } @addseq),
+     (map { my $v = $tmph{$_}; $v && @$v ? (@{$tmph{$_}}) : () }
           sort grep { !$postseq{$_} } keys %tmph),
-     (map { $v = $tmph{$_}; $v && @$v ? (@{$tmph{$_}}) : () } @postseq));
+     (map { my $v = $tmph{$_}; $v && @$v ? (@{$tmph{$_}}) : () } @postseq));
 }
+
+# the above is admittedly somewhat hairy.
 
 #sub headers
 #{
@@ -333,7 +378,8 @@ header with the specified value(s). Each value may be a single scalar,
 or a reference to an array of values. Returns undef without completing
 the assignments if any attempt is made to supply multiple values for a
 unique header. Undef or empty values cause the header to be deleted.
-(If an array is supplied, it is not copied.)
+(If an array is supplied, it is not copied. This is probably a mistake
+and should not be relied on.)
 
 =cut
 
@@ -531,10 +577,9 @@ sub bytes
 
 =item set_body ( BODY )
 
-Replace the current article body with the specified text.
-Expects a list, each item of which is either one line,
-or multiple lines separated by newlines (but with no final
-newline).
+Replace the current article body with the specified text.  Expects a
+list, each item of which is either one line, or multiple lines
+separated by newlines. (Trailing newlines on the values are ignored.)
 
 =cut
 
@@ -549,10 +594,10 @@ sub set_body
 
 =item add_body ( BODY )
 
-Append the specified text to the current article body.
-Expects a list, each item of which is either one line,
-or multiple lines separated by newlines (but with no final
-newline), or a reference to an array of lines.
+Append the specified text to the current article body.  Expects a
+list, each item of which is either one line, or multiple lines
+separated by newlines, or a reference to an array of lines. (Trailing
+newlines on the values are ignored.)
 
 =cut
 
@@ -560,7 +605,6 @@ sub add_body
 {
     my $self = shift;
     my $body = $self->{Body};
-    local($_);
 
     for (@_)
     {
@@ -574,6 +618,23 @@ sub add_body
 	    push @$body,@lines ? @lines : "";
 	}
     }
+}
+
+#--------------------------------------------------------------------------
+
+=item trim_blank_lines ()
+
+Remove any trailing blank lines from the article body. Returns the
+number of lines removed.
+
+=cut
+
+sub trim_blank_lines
+{
+    my $body = shift->{Body};
+    my $n = 0;
+    while (@$body && $body->[$#$body] =~ /^\s*$/) { pop @$body; ++$n; }
+    return $n;
 }
 
 ###########################################################################
@@ -605,6 +666,8 @@ sub read_headers
     $self->{Body} = [];
     $self->{Headers} = $hhead;
 
+    my $hseq = $self->{HeaderSeq} = [];
+
     # If we have read some raw headers already, append a marker.  This
     # is partly to cope with C-news/ANU-news moderator mail, where the
     # news article is encapsulated in a mail message rather than
@@ -617,8 +680,6 @@ sub read_headers
 
     $source = source_init($source);
     return undef unless defined($source);
-
-    local($_);
 
     my $line;
 
@@ -634,14 +695,22 @@ sub read_headers
 	for (split(/\n/,$line))
 	{
 	    # lines of whitespace only are allowed in continuations - but
-	    # we drop them as they serve no useful purpose 
+	    # we drop them as they serve no useful purpose
+	    # XXX - what about signatures? not an issue for pgpmoose or
+	    #       signcontrol, neither of which allow continuations in
+	    #       signed headers at all, but could become an issue in the
+	    #       future - in which case this behaviour would have to be
+	    #       removed
 	    next if /^\s*$/;
 
 	    # Envelope From (unix-style). Must be the first line, and we trim
 	    # off the timestamp if present
 
-	    $self->{Envelope} = fix_envelope($POSTMATCH), next 
-		if !$last && /^From /;
+	    if (!$last && /^From (.*)$/)
+	    {
+		$self->{Envelope} = fix_envelope($1);
+		next;
+	    }
 
 	    # Ignore bogus extra >From lines (procmail has a bad habit of adding
 	    # these, unpredictably, unless you recompile it to trust everybody)
@@ -679,22 +748,15 @@ sub read_headers
 	    }
 	    
 	    # Tack raw header onto array of raw headers
-	    
+
+	    push @$hseq,canonical($name);
 	    push @$head,$_;
 	    
 	    # Add header to hash. Roughly equivalent to add_header, but
 	    # handles duplicate unique headers silently
 
 	    $last = \@{$hhead->{$name}};
-
-	    if ($UNIQUE{$name})
-	    {
-		@$last = ( $val );
-	    }
-	    else
-	    {
-		push @$last,$val;
-	    }
+	    push @$last,$val unless $UNIQUE{$name} && @$last;
 	}
     }
 
@@ -710,7 +772,9 @@ end of file; fails (returning undef) if MAXSIZE is reached prior to
 that point.  Returns the number of bytes read (may be 0 if the body is
 null).
 
-Useless trailing blank lines are removed.
+Trailing blank lines are NOT removed (an incompatible, but regrettably
+necessary, change from previous versions); see trim_blank_lines if you
+need to do that.
 
 =cut
 	
@@ -724,8 +788,6 @@ sub read_body
     $source = source_init($source);
     return undef unless defined($source);
 
-    local($_);
-
     my $body = $self->{Body} = [];
     my $line;
 
@@ -735,15 +797,11 @@ sub read_body
 	chomp $line;
 	push @$body,"" unless $line;
 
-	for (split(/\n/,$line))
+	for (split(/\n/,$line,-1))
 	{
 	    push @$body,$_;
 	}
     }
-
-    # remove excess trailing blank lines
-
-    while (@$body && $body->[$#$body] =~ /^\s*$/) { pop @$body; }
 
     # return the article size
     $size;
@@ -819,6 +877,62 @@ sub write
     print $fh join("\n", $self->headers(), "", @{$self->{Body}}, "");
 }
 
+=item write_unique_file ( DIR [,MODE] )
+
+Write the article to a (hopefully) uniquely-named file in the
+specified directory.  The file is written under a temporary name (with
+a leading period) and relinked when complete. Returns 1 if successful,
+otherwise undef.
+
+MODE is the access mode to use for the created file (default 644);
+this will be modified in turn by the current umask.
+
+The implementation is careful to avoid losing the file or clobbering
+existing files even in the case of a name collision, but relies on
+POSIX link() semantics and may fail on lesser operating systems
+(or buggy NFS implementations).
+
+=cut
+
+sub write_unique_file;
+
+use POSIX qw(:errno_h);
+use Fcntl;
+use FileHandle ();
+
+; sub write_unique_file
+{
+    my ($self, $dir, $mode) = @_;
+
+    return undef unless defined($dir) and length($dir);
+    $mode = 0644 unless defined($mode);
+
+    my ($name,$tname,$fh);
+
+    do 
+    {
+	$tname = $name = $self->_unique_name();
+	$tname =~ s/^././;
+	$fh = FileHandle->new("$dir/$tname", O_CREAT|O_EXCL|O_WRONLY, $mode);
+    } 
+    while (!$fh && $! == &EEXIST);
+    return undef unless $fh;
+
+    my $success;
+
+    if ($self->write($fh) && $fh->close())
+    {
+	while (!link("$dir/$tname","$dir/$name") && $! == &EEXIST)
+	{
+	    $name = $self->_unique_name();
+	}
+	$success = 1;
+    }
+
+    unlink("$dir/$tname");
+    return $success;
+}
+
 #--------------------------------------------------------------------------
 
 =item write_original ( FILE )
@@ -864,15 +978,20 @@ set, so unset that before mailing if you do not want this behavior.
 
 =cut
 
-sub mail 
+sub mail;
+
+use FileHandle ();
+use IPC::Open3 qw(open3);
+
+; sub mail 
 {
     my ($self, @recipients) = @_;
     my @command = @{$self->{Sendmail}};
     push @command,'-f',$self->{Envelope} if (defined($self->{Envelope}));
     push @command, @recipients ? @recipients : '-t';
 
-    my $sendmail = new FileHandle;
-    my $errors = new FileHandle;
+    my $sendmail = FileHandle->new();
+    my $errors = FileHandle->new();
 
     eval { open3 ($sendmail, $errors, $errors, @command) };
     if ($@) { return undef }
@@ -901,14 +1020,18 @@ Throws an exception containing the error message on failure.
 
 =cut
 
-sub post
+sub post;
+
+use Net::NNTP ();
+
+; sub post
 {
     my $self = shift;
     my $server = shift;
 
     if (!$server)
     {
-	$server = new Net::NNTP;
+	$server = Net::NNTP->new();
 	die "Unable to connect to server" unless $server;
 	$server->reader();
     }
@@ -930,7 +1053,11 @@ Throws an exception containing the error message on failure.
 
 =cut
 
-sub ihave
+sub ihave;
+
+use Net::NNTP ();
+
+; sub ihave
 {
     my $self = shift;
     my $server = shift;
@@ -940,7 +1067,7 @@ sub ihave
 
     if (!$server)
     {
-	$server = new Net::NNTP;
+	$server = Net::NNTP->new();
 	die "Unable to connect to server" unless $server;
     }
 
@@ -958,7 +1085,11 @@ If the current article lacks a message-id, then create one.
 
 =cut
 
-sub add_message_id
+sub add_message_id;
+
+use Net::Domain qw(hostfqdn);
+
+; sub add_message_id
 {
     my $self = shift;
     return undef if $self->{Headers}{'message-id'};
@@ -976,9 +1107,11 @@ sub add_message_id
 
 #--------------------------------------------------------------------------
 
-=item add_date ()
+=item add_date ( [TIME] )
 
 If the current article lacks a date, then add one (in local time).
+If TIME is specified (numerical Unix time), it is used instead of the
+current time.
 
 =cut
 
@@ -987,9 +1120,15 @@ sub add_date
     my $self = shift;
     return undef if $self->{Headers}{'date'};
 
-    my $now = time;
-    my ($sec,$min,$hr,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
-    my ($gsec,$gmin,$ghr,$gmday) = gmtime(time);
+    my $now = shift || time;
+    my ($sec,$min,$hr,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($now);
+    my ($gsec,$gmin,$ghr,$gmday) = gmtime($now);
+
+    # mystic incantations to calculate zone offset from difference
+    # between UTC and local time. Assumes that difference is not more
+    # than a full day (saves having to take months into consideration).
+    # ANSI is apparently going to add a spec to strftime() to do this,
+    # but that isn't yet commonly available.
 
     use integer;
     $gmday = $mday + ($mday <=> $gmday) if (abs($mday-$gmday) > 1);
@@ -1000,7 +1139,7 @@ sub add_date
     $wday = (qw(Sun Mon Tue Wed Thu Fri Sat Sun))[$wday];
     $year += 1900;
     $self->set_headers('date',
-		       sprintf("%s, %02d %s %d %02d:%02d:%02d $tz",
+		       sprintf("%s, %02d %s %d %02d:%02d:%02d %s",
 			       $wday,$mday,$mon,$year,$hr,$min,$sec,$tz));
 }
    
@@ -1008,6 +1147,52 @@ sub add_date
 ###########################################################################
 # AUTHENTICATION FUNCTIONS
 ###########################################################################
+
+# Internal function used by PGPMoose sign/verify code
+
+sub pgpmoose_canon_headers
+{
+    my ($self, $bug_compatible) = @_;
+
+    # Now, put together all of the stuff we need to sign.  First, we need a
+    # list of newsgroups, sorted.
+
+    my $headers = $self->header('newsgroups');
+    $headers =~ s/\s//g;
+    $headers = join("\n", (sort split(/,+/, $headers)), '');
+
+    # Next we need an array of headers: From, Subject, and Message-ID in
+    # that order, killing initial and final whitespace and any spaces after
+    # colons.
+    # PGPMoose V1.1 has a gross bug: it includes, as though they were headers,
+    # any body lines that look like headers. Do this only if $bug_compatible
+
+    my %heads = map { ($_, [ $self->header($_) ]) } qw(from subject message-id);
+
+    if ($bug_compatible)
+    {
+	for (@{$self->{Body}})
+	{
+	    /^from: *(.*)$/i && push @{$heads{from}},$1;
+	    /^subject: *(.*)$/i && push @{$heads{subject}},$1;
+	    /^message-id: *(.*)$/i && push @{$heads{'message-id'}},$1;
+	}
+    }
+
+    for (@heads{'from','subject','message-id'})
+    {
+	for (@$_)
+	{
+	    s/\n.*//;
+	    s/^ +//;
+	    s/\s*$/\n/;
+	    s/: +/:/g;
+	    $headers .= $_;
+	}
+    }
+
+    $headers;
+}
 
 =item sign_pgpmoose ( GROUP, PASSPHRASE [, KEYID] )
 
@@ -1030,7 +1215,11 @@ added if necessary.
 
 =cut
 
-sub sign_pgpmoose 
+sub sign_pgpmoose;
+
+use PGP::Sign qw(pgp_sign pgp_verify pgp_error);
+
+; sub sign_pgpmoose 
 {
     my ($self, $group, $passphrase, $keyid) = @_;
 
@@ -1048,27 +1237,12 @@ sub sign_pgpmoose
 	    unless $self->{Headers}{$_};
     }
 
-    $self->add_message_id();
+    $self->add_message_id() unless $self->{Headers}{'message-id'};
 
-    # Now, put together all of the stuff we need to sign.  First, we need a
-    # list of newsgroups, sorted.
+    # Now, put together all of the stuff we need to sign.
+    # XXX generate V1.1 bug-compatible version for now.
 
-    my $headers = $self->header('newsgroups');
-    $headers =~ s/\s//g;
-    $headers = join("\n", (sort split(/,+/, $headers)), '');
-
-    # Next we need an array of headers: From, Subject, and Message-ID in
-    # that order, killing initial and final whitespace and any spaces after
-    # colons.
-    for (qw(from subject message-id))
-    {
-        my $value = $self->header($_);
-        $value =~ s/\n.*//;
-        $value =~ s/^ +//;
-        $value =~ s/\s+$//;
-        $value =~ s/: +/:/g;
-        $headers .= $value . "\n";
-    }
+    my $headers = $self->pgpmoose_canon_headers(1);
 
     # Finally, we need to give it the body of the article, making the
     # following transformations:
@@ -1125,7 +1299,11 @@ the signer identity (from the PGP output), otherwise returns false.
 
 =cut
 
-sub verify_pgpmoose 
+sub verify_pgpmoose;
+
+use PGP::Sign qw(pgp_sign pgp_verify pgp_error);
+
+; sub verify_pgpmoose 
 {
     my ($self, $group, $keyid) = @_;
 
@@ -1134,28 +1312,15 @@ sub verify_pgpmoose
 
     return undef unless $sig;
 
+    my ($ver) = $sig =~ /^ PGPMoose \s+ V(\d\.\d) \s+/isx;
+
     $sig =~ s/[^\n]*\n//;
     $sig =~ s/\t//g;
 
-    # Now, put together all of the stuff we need to sign.  First, we need a
-    # list of newsgroups, sorted.
+    # Now, put together all of the stuff we need to sign.
+    # XXX Optimistically, assume that pmcanon will be fixed after 1.1.
 
-    my $headers = $self->header('newsgroups');
-    $headers =~ s/\s//g;
-    $headers = join ("\n", (sort split (/,+/, $headers)), '');
-
-    # Next we need an array of headers: From, Subject, and Message-ID in
-    # that order, killing initial and final whitespace and any spaces after
-    # colons.
-    for (qw(from subject message-id)) 
-    {
-        my $value = $self->header($_);
-        $value =~ s/\n.*//;
-        $value =~ s/^ +//;
-        $value =~ s/\s+$//;
-        $value =~ s/: +/:/g;
-        $headers .= $value . "\n";
-    }
+    my $headers = $self->pgpmoose_canon_headers($ver eq '1.1');
 
     # Finally, we need to give it the body of the article, making the
     # following transformations:
@@ -1207,7 +1372,11 @@ and Message-ID are automatically added if needed.
 
 =cut
 
-sub sign_control 
+sub sign_control;
+
+use PGP::Sign qw(pgp_sign pgp_verify pgp_error);
+
+; sub sign_control 
 {
     my ($self, $keyid, $passphrase, @extra) = @_;
     my @headers = qw(subject control message-id date from sender);
@@ -1220,7 +1389,7 @@ sub sign_control
 	    unless $self->{Headers}{$_};
     }
 
-    $self->add_message_id('cmsg-');
+    $self->add_message_id('cmsg-') unless $self->{Headers}{'message-id'};
     $self->add_date();
 
     # We have to sign the list of headers and each header on a seperate
@@ -1255,13 +1424,44 @@ sub sign_control
 
     # Add tabs after the newlines and add the signature to the headers.
     $signature =~ s/\n(.)/\n\t$1/g;
+
+    # Fix up version field (needed for at least PGP 6.5.1i)
+    $version =~ s/^[PGpg]+\s+//;   # remove initial PGP or GPG or whatever
+    $version =~ s/\s+/_/g;         # convert any remaining whitespace
+
     $self->add_headers('x-pgp-sig', "$version $signheads\n\t$signature");
     return ();
 }
 
 ###########################################################################
+# INTERNAL METHODS
+###########################################################################
+
+# Unique name generator for write_unique_file. This is called as a method
+# to allow it to be overridden (should anyone want to). The implementation
+# specifically takes account of the possibility of multiple calls in quick
+# succession from the same process (and possibly different objects, which
+# is why $unique_count is not an instance variable).
+
+sub _unique_name;
+
+my $unique_count = "aa";
+
+; sub _unique_name
+{
+    my $name = sprintf("%08x%04x%2s",
+		       time & 0xffffffff,
+		       $$ & 0xffff,
+		       $unique_count);
+    $unique_count = "aa" if (length(++$unique_count) > 2);
+    return $name;
+}
+
+###########################################################################
 # INTERNAL FUNCTIONS
 ###########################################################################
+
+# really ought to convert some of these to methods.
 
 # Convert a header name to canonical capitalisation. We keep the header
 # names in lowercase internally to simplify, but prefer to emit standard-
@@ -1310,6 +1510,15 @@ sub fix_envelope
 #  SCALARs (treated as filenames)
 #  CODE refs are left unchanged
 
+sub source_init_filehandle;
+
+use FileHandle ();
+
+; sub source_init_filehandle
+{
+    return FileHandle->new(shift);
+}
+
 sub source_init
 {
     my $source = shift;
@@ -1337,7 +1546,6 @@ sub source_init
 			 }
 			 else
 			 {
-			     ++$pos;
 			     return substr($$source,$tmp,($pos - $tmp));
 			 }
 		     };
@@ -1345,7 +1553,7 @@ sub source_init
     
 	if (!ref($source))
 	{
-	    $source = new FileHandle("<$source");
+	    $source = source_init_filehandle("<$source");
 	    return undef unless $source;
 	}
     }
@@ -1362,8 +1570,131 @@ sub source_init
 __END__
 
 ###########################################################################
+
+=head1 CAVEATS
+
+This module is not fully transparent. In particular:
+
+=over 4
+
+=item -
+
+Case of headers is smashed
+
+=item -
+
+improper duplicate headers may be discarded
+
+=item -
+
+Broken or dubious header names are not preserved
+
+=back
+
+These factors make it undesirable to use this module in news transit
+applications.
+
+=head1 AUTHOR
+
+Written by Andrew Gierth <andrew@erlenstar.demon.co.uk>
+
+Thanks to Russ Allbery <rra@stanford.edu> for comments and
+suggestions.
+
+=head1 COPYRIGHT
+
+Copyright 1997 Andrew Gierth <andrew@erlenstar.demon.co.uk>
+
+This code may be used and/or distributed under the same terms as Perl
+itself.
+
+=cut
+
+###########################################################################
+#
+# Random Comments
+#
+# Consistency: I'd like to drop the use of FileHandle in favour of the
+# IO::* modules, but I don't want to completely break with 5.003 at this
+# stage (though I no longer test with 5.003, so there is no guarantee that
+# it works at all).
+#
+# Use of $_; at present, I'm confining it to for() and map{} / grep{}
+# constructs (where it is implicitly localised).
+#
+# SelfLoader: the use of funky indenting to do deferred 'use' statements
+# and other compile-time stuff seems to me to be over-kludgy. It's merely
+# an artifact of SelfLoader's fairly simplistic method of locating the
+# start and end of each function.
+#
+# Net::Domain seems to do poorly on BSD systems without permanent 
+# connectivity (hangs in domainname() doing unnecessary DNS lookups).
+# Must take that up with the maintainer at some stage if it hasn't 
+# already been fixed.
+#
+# indirect-object vs. method call syntax for ctors: I still can't decide
+# which I prefer. I've removed all the IO ones for now.
+#
+#
+
+###########################################################################
 #
 # $Log: Article.pm $
+# Revision 1.26  2001/11/08 14:11:43  andrew
+# remove stray spaces from unique filenames
+#
+# Revision 1.25  2001/04/20 12:11:31  andrew
+# handle PGP versions that put spaces in the version field, in sign_control
+#
+# Revision 1.24  2001/01/18 09:48:44  andrew
+# work around a SelfLoader issue.
+# Allow $obj->new() to work as well as CLASS->new()
+#
+# Revision 1.23  2000/04/14 15:11:49  andrew
+# handle newlines in body better
+#
+# Revision 1.22  2000/04/02 12:02:27  andrew
+# add parameter to add_date
+#
+# Revision 1.21  1998/10/21 03:15:31  andrew
+# Doc tweaks and minor cleanup.
+# Improvements to write_unique_file to handle collisions.
+#
+# Revision 1.20  1998/10/18 06:01:00  andrew
+# Speedup to source_init when FileHandle is not required
+#
+# Revision 1.19  1998/10/18 05:41:32  andrew
+# Added write_unique_file
+#
+# Revision 1.18  1998/10/18 03:42:19  andrew
+# read_body no longer strips blank lines.
+# trim_blank_lines added to compensate.
+# Added IP, HTTP and URL to list of abbreviations used in canonical
+# headers.
+# Original sequence of headers is handled slightly differently.
+#
+# Revision 1.17  1998/07/05 18:03:05  andrew
+# Fix the PGPMoose bug-compatible code to handle tabs the same
+# way as the reference code
+#
+# Revision 1.16  1998/07/05 08:40:18  andrew
+# Bugfix to read(SCALAR) not to drop characters.
+#
+# Rehash the PGPMoose code to correctly emulate the disgusting bug in
+# PGPMoose V1.1 which treats body lines as though they were headers.
+#
+# Revision 1.15  1998/02/26 00:50:46  andrew
+# Cleanup:
+#   - remove "use English"
+#   - use Selfloader to cut startup time
+#   - minor mods (in sign_control and sign_pgpmoose) to avoid pulling
+#     in selfloaded sub add_message_id unless needed
+#   - change read_header to keep first copy of duplicate unique header,
+#     rather than last copy
+#
+# Revision 1.14  1997/12/29 14:35:26  andrew
+# Fixed order-reverse problem in headers() (oops)
+#
 # Revision 1.13  1997/12/27 23:19:07  andrew
 # Missing 'x' flag on extended regexp in fix_envelope
 #
@@ -1409,20 +1740,4 @@ __END__
 #
 ###########################################################################
 
-=head1 AUTHOR
 
-Written by Andrew Gierth <andrew@erlenstar.demon.co.uk>
-
-Thanks to Russ Allbery <rra@stanford.edu> for comments and
-suggestions.
-
-=head1 COPYRIGHT
-
-Copyright 1997 Andrew Gierth <andrew@erlenstar.demon.co.uk>
-
-This code may be used and/or distributed under the same terms as Perl
-itself.
-
-=cut
-
-###########################################################################

@@ -4,13 +4,13 @@
 #
 # Copyright 1997 Andrew Gierth. Redistribution terms at end of file.
 #
-# $Id: AutoReply.pm 1.5 1997/10/22 21:00:10 andrew Exp $
+# $Id: AutoReply.pm 1.10 2001/11/08 14:10:12 andrew Exp $
 #
 ###########################################################################
 #
 # Address, n. 1. A formal discourse, usually delivered to a person who has
 #             something by a person who wants something that he has.
-#             2. The place at which one recieves the delicate attentions
+#             2. The place at which one receives the delicate attentions
 #             of creditors.
 #                                                        -- Ambrose Bierce
 #
@@ -18,6 +18,12 @@
 =head1 NAME
 
 News::AutoReply - derivative of News::Article for generating autoreplies
+
+=head1 SYNOPSIS
+
+  use News::AutoReply;
+
+  $reply = News::AutoReply->new($message);
 
 =head1 DESCRIPTION
 
@@ -37,7 +43,6 @@ package News::AutoReply;
 
 use News::Article;
 use strict;
-use English;
 use vars qw(@ISA);
 
 @ISA = qw(News::Article);
@@ -100,38 +105,36 @@ sub reply_init
     my $srcid = $src->header("message-id");
     $self->set_headers("in-reply-to" => $srcid) if $srcid;
 
-    my $refs = $src->header("references");
-    if ($refs)
+    my $refs = $src->header("references") || '';
+    my @refs = split(' ',$refs);
+    push @refs,$srcid if $srcid;
+    if ($refs = $self->fold_references(@refs))
     {
-	$refs =~ tr/ \t\n/ /s;
-	$refs .= " ".$srcid if $srcid;
-	my $newrefs = "";
-	my $line = 5;
-	while ($refs)
-	{
-	    if ($refs =~ /([^\s]*)\s+/)
-	    {
-		if (($line + length($1)) < 70 || !$newrefs || !$line)
-		{
-		    $newrefs .= " ".$1;
-		    $line += 1 + length($1);
-		}
-		else
-		{
-		    $newrefs .= "\n\t".$1;
-		    $line = 1 + length($1);
-		}
-	    }
-	    $refs = $POSTMATCH;
-	}
-	$self->set_headers(references => $newrefs);
-    }
-    elsif ($srcid)
-    {
-	$self->set_headers(references => $srcid);
+        $self->set_headers(references => $refs);
     }
 
     return $self;
+}
+
+#----------------------------------------------------------------------------
+# private; called as a method to allow overriding if necessary.
+
+sub fold_references
+{
+    my $self = shift;
+    my $refs = shift || '';
+    my $length = 4 + length($refs);
+
+    while (@_)
+    {
+	my $ref = shift;
+	$length += 1 + length($ref);
+	$refs .= ($length < 72) ? ' ' : "\n\t";
+	$refs .= $ref;
+	$length = length($ref) unless $length < 72;
+    }
+
+    $refs;
 }
 
 1;
@@ -141,6 +144,21 @@ __END__
 ###########################################################################
 #
 # $Log: AutoReply.pm $
+# Revision 1.10  2001/11/08 14:10:12  andrew
+# don't include References header if there are no references.
+#
+# Revision 1.9  1998/10/18 06:03:21  andrew
+# Added SYNOPSIS
+#
+# Revision 1.8  1998/02/26 01:43:43  andrew
+# another minor tweak to reference-folding
+#
+# Revision 1.7  1998/02/26 01:38:46  andrew
+# minor tweak to reference-folding
+#
+# Revision 1.6  1998/02/26 01:21:23  andrew
+# Fixed the references-folding code a bit.
+#
 # Revision 1.5  1997/10/22 21:00:10  andrew
 # Cleanup terms for public release
 #

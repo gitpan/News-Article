@@ -4,12 +4,18 @@
 #
 # Copyright 1997 Andrew Gierth. Redistribution terms at end of file.
 #
-# $Id: FormReply.pm 1.4 1997/10/22 21:01:31 andrew Exp $
+# $Id: FormReply.pm 1.5 1998/10/18 06:04:56 andrew Exp $
 #
 
 =head1 NAME
 
 News::FormReply - derivative of News::FormArticle and News::AutoReply
+
+=head1 SYNOPSIS
+
+  use News::FormReply;
+
+See below for functions available.
 
 =head1 DESCRIPTION
 
@@ -67,6 +73,9 @@ __END__
 ###########################################################################
 #
 # $Log: FormReply.pm $
+# Revision 1.5  1998/10/18 06:04:56  andrew
+# added SYNOPSIS
+#
 # Revision 1.4  1997/10/22 21:01:31  andrew
 # Cleanup for release.
 #
