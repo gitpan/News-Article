@@ -6,7 +6,7 @@
 #
 # Copyright 1997 Andrew Gierth. Redistribution terms at end of file.
 #
-# $Id: Article.pm 1.26 2001/11/08 14:11:43 andrew Exp $
+# $Id: Article.pm 1.27 2002/08/11 22:51:38 andrew Exp $
 #
 # TODO:
 #   - better way of handling the system-dependent configuration
@@ -53,7 +53,7 @@ use SelfLoader;
 use vars qw($VERSION @SENDMAIL %SPECIAL %UNIQUE);
 use subs qw(canonical fix_envelope source_init);
 
-($VERSION = (split (' ', q$Revision: 1.26 $ ))[1]) =~ s/\.(\d)$/.0$1/;
+($VERSION = (split (' ', q$Revision: 1.27 $ ))[1]) =~ s/\.(\d)$/.0$1/;
 
 ###########################################################################
 # System-dependent configuration
@@ -1603,7 +1603,7 @@ suggestions.
 
 =head1 COPYRIGHT
 
-Copyright 1997 Andrew Gierth <andrew@erlenstar.demon.co.uk>
+Copyright 1997-2002 Andrew Gierth <andrew@erlenstar.demon.co.uk>
 
 This code may be used and/or distributed under the same terms as Perl
 itself.
@@ -1640,6 +1640,9 @@ itself.
 ###########################################################################
 #
 # $Log: Article.pm $
+# Revision 1.27  2002/08/11 22:51:38  andrew
+# no changes, other than copyright date, this is just to bumb the version no.
+#
 # Revision 1.26  2001/11/08 14:11:43  andrew
 # remove stray spaces from unique filenames
 #

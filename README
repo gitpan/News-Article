@@ -14,9 +14,8 @@ MODULES
 
 STATUS
 
-  This is the first public ALPHA release. The interface is believed to
-  be reasonably stable; the modules are in use in at least two
-  different projects at this time.
+  This release is considered reasonably stable, both in functionality
+  and interface.
 
 INTRODUCTION
 
@@ -66,7 +65,8 @@ INSTALLATION
         make
         make install
 
-  You'll probably need to do the last as root.  There is no test suite.
+  You'll probably need to do the last as root.  A testsuite (though not
+  an extensive one yet) is supplied.
 
 THANKS
 
@@ -79,6 +79,6 @@ AUTHOR
 
 AVAILABILITY
 
-  See http://www.erlenstar.demon.co.uk/perl
+  CPAN, or see http://www.erlenstar.demon.co.uk/perl
 
 END
